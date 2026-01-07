@@ -9,7 +9,7 @@ from io import BytesIO
 from datetime import datetime, timedelta
 from scipy.spatial import cKDTree
 
-st.set_page_config(page_title="Master Dashboard v10.2", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Master Dashboard v10.4", layout="wide", page_icon="⚡", initial_sidebar_state="expanded")
 
 # ============================================================================
 # 1. CONFIGURATION & STATE
@@ -31,8 +31,6 @@ if 'data_initialized' not in st.session_state: st.session_state.data_initialized
 def safe_dedupe(df, target_col):
     """Safely remove duplicates and RESET INDEX to prevent 'duplicate labels' error."""
     if df.empty: return df
-    
-    # Dedupe logic
     if target_col in df.columns:
         df = df.drop_duplicates(subset=target_col, keep='last')
     else:
@@ -41,8 +39,6 @@ def safe_dedupe(df, target_col):
             df = df.drop_duplicates(subset=col_map[target_col.lower()], keep='last')
         else:
             df = df.drop_duplicates()
-            
-    # CRITICAL FIX: Reset Index to ensure uniqueness
     return df.reset_index(drop=True)
 
 @st.cache_data(ttl=3600)
@@ -78,68 +74,87 @@ def load_static_files(points_files, fleet_file):
 
     return points_df, fleet_df
 
-def fetch_api_data_live(token, s, e):
+def fetch_chunk(base, head, payload):
+    """Helper to fetch a single API call safely."""
+    try:
+        r = requests.post(base, headers=head, json=payload, timeout=45)
+        if r.status_code == 200:
+            df = pd.read_excel(BytesIO(r.content))
+            if not df.empty: 
+                df.columns = df.columns.str.lower().str.strip()
+            return df
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
+def fetch_api_data_batched(token, start_dt, end_dt):
+    """Fetches data in 7-day chunks to prevent timeouts."""
     base = "https://dashboard.rabbit-api.app/export"
     head = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    s_str = f"{s}T00:00:00{TIME_OFFSET}"
-    e_str = f"{e}T23:59:59{TIME_OFFSET}"
+    # 1. Generate Batches
+    date_ranges = []
+    curr = start_dt
+    while curr <= end_dt:
+        nxt = min(curr + timedelta(days=6), end_dt) # 7-day chunks
+        date_ranges.append((curr, nxt))
+        curr = nxt + timedelta(days=1)
 
-    steps = [
-        ("Sessions", {"module": "AppSessions", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str, "lat": None, "lng": None, "radius": None, "inRide": "all", "error": "", "areas": []})}),
-        ("Rides", {"module": "RidesSucess", "format": "excel", "fields": "id,userId,area,userSignupDateLocal,scooter,duration,totalCost,actualCost,paidWithBalance,paidWithPromocode,paidWithSubscription,start_date_local,end_date_local,startLat,startLong,stopLat,stopLong,rating", "filters": json.dumps({"startDate": s_str, "endDate": e_str})}),
-        ("Logs", {"module": "VehicleLogs", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str, "isOperating": "All", "logCase": "All"})}),
-        ("Attendance", {"module": "Attendance", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str})})
-    ]
-
+    # 2. UI Setup
     prog_bar = st.progress(0)
     status_text = st.empty()
+    total_batches = len(date_ranges)
     
-    results = []
-    start_time = time.time()
-    total_steps = len(steps)
-
-    try:
-        for i, (name, payload) in enumerate(steps):
-            elapsed = time.time() - start_time
-            if i > 0:
-                avg_time = elapsed / i
-                eta = avg_time * (total_steps - i)
-                status_text.markdown(f"**Fetching {name}...** (⏳ ETA: {int(eta)}s)")
-            else:
-                status_text.markdown(f"**Fetching {name}...**")
-
-            r = requests.post(base, headers=head, json=payload, timeout=120)
-            
-            if r.status_code == 200:
-                df = pd.read_excel(BytesIO(r.content))
-                if not df.empty: df.columns = df.columns.str.lower().str.strip()
-                results.append(df)
-            else:
-                st.error(f"Failed to fetch {name}: {r.status_code}")
-                results.append(pd.DataFrame())
-            
-            prog_bar.progress((i + 1) / total_steps)
-
-        status_text.empty()
-        prog_bar.empty()
+    # 3. Storage
+    all_s, all_r, all_l, all_a = [], [], [], []
+    
+    # 4. Loop
+    for idx, (s, e) in enumerate(date_ranges):
+        s_str = f"{s}T00:00:00{TIME_OFFSET}"
+        e_str = f"{e}T23:59:59{TIME_OFFSET}"
         
-        return results[0], results[1], results[2], results[3], None
+        # Update UI
+        pct = idx / total_batches
+        prog_bar.progress(pct)
+        status_text.markdown(f"**📥 Fetching Batch {idx+1}/{total_batches}:** {s} to {e}...")
 
-    except Exception as ex:
-        status_text.empty()
-        prog_bar.empty()
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), str(ex)
+        # -- Sessions --
+        p_sess = {"module": "AppSessions", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str, "lat": None, "lng": None, "radius": None, "inRide": "all", "error": "", "areas": []})}
+        all_s.append(fetch_chunk(base, head, p_sess))
+
+        # -- Rides --
+        r_fields = "id,userId,area,userSignupDateLocal,scooter,duration,totalCost,actualCost,paidWithBalance,paidWithPromocode,paidWithSubscription,start_date_local,end_date_local,startLat,startLong,stopLat,stopLong,rating"
+        p_ride = {"module": "RidesSucess", "format": "excel", "fields": r_fields, "filters": json.dumps({"startDate": s_str, "endDate": e_str})}
+        all_r.append(fetch_chunk(base, head, p_ride))
+
+        # -- Logs --
+        p_logs = {"module": "VehicleLogs", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str, "isOperating": "All", "logCase": "All"})}
+        all_l.append(fetch_chunk(base, head, p_logs))
+
+        # -- Attendance --
+        p_attend = {"module": "Attendance", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str})}
+        all_a.append(fetch_chunk(base, head, p_attend))
+
+    # 5. Finalize
+    prog_bar.progress(1.0)
+    status_text.success("✅ Fetch Complete! Merging data...")
+    time.sleep(0.5)
+    status_text.empty()
+    prog_bar.empty()
+    
+    final_s = pd.concat(all_s, ignore_index=True) if all_s else pd.DataFrame()
+    final_r = pd.concat(all_r, ignore_index=True) if all_r else pd.DataFrame()
+    final_l = pd.concat(all_l, ignore_index=True) if all_l else pd.DataFrame()
+    final_a = pd.concat(all_a, ignore_index=True) if all_a else pd.DataFrame()
+    
+    return final_s, final_r, final_l, final_a, None
 
 # ============================================================================
 # 3. PROCESSING ENGINES
 # ============================================================================
 def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
     if df.empty or points_df is None or points_df.empty: return df
-    
-    # CRITICAL FIX: Reset Index
     df = df.reset_index(drop=True)
-    
     df.columns = df.columns.str.lower().str.strip()
     lat_col = lat_col.lower()
     lon_col = lon_col.lower()
@@ -150,7 +165,6 @@ def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
     if not p_lat: return df
 
     if lat_col not in df.columns or lon_col not in df.columns: return df
-
     valid = df.dropna(subset=[lat_col, lon_col]).copy()
     valid = valid[(valid[lat_col]!=0) & (valid[lon_col]!=0)]
     if valid.empty: return df
@@ -165,7 +179,6 @@ def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
 
     p_cart = to_cart(points_df[p_lat].values, points_df[p_lon].values)
     t_cart = to_cart(valid[lat_col].values, valid[lon_col].values)
-    
     tree = cKDTree(p_cart)
     dists, idxs = tree.query(t_cart, k=1)
     mask = dists <= radius
@@ -181,7 +194,6 @@ def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
     else:
         df['assigned area'] = 'Out of Fence'
         if p_area: valid.loc[mask, 'assigned area'] = points_df.iloc[matched_idxs][p_area].values
-    
     df.update(valid)
     return df
 
@@ -189,7 +201,6 @@ def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
 def process_data(df_s, df_r, points_df, radius):
     if df_s is None: df_s = pd.DataFrame()
     if df_r is None: df_r = pd.DataFrame()
-
     if not df_s.empty:
         in_ride_col = next((c for c in df_s.columns if c == 'in ride'), None)
         if in_ride_col: df_s = df_s[df_s[in_ride_col].astype(str).str.strip().str.lower() != 'yes']
@@ -198,97 +209,73 @@ def process_data(df_s, df_r, points_df, radius):
             s_lat = next((c for c in df_s.columns if c in ['lat', 'latitude']), 'lat')
             s_lon = next((c for c in df_s.columns if c in ['lng', 'longitude', 'long']), 'lng')
             df_s = build_tree_match(df_s, points_df, radius, s_lat, s_lon)
-
     if not df_r.empty and points_df is not None and not points_df.empty:
         r_start_lat = next((c for c in df_r.columns if 'start' in c and 'lat' in c), 'startlat')
         r_start_lon = next((c for c in df_r.columns if 'start' in c and ('lon' in c or 'lng' in c)), 'startlong')
         r_stop_lat = next((c for c in df_r.columns if ('stop' in c or 'end' in c) and 'lat' in c), 'stoplat')
         r_stop_lon = next((c for c in df_r.columns if ('stop' in c or 'end' in c) and ('lon' in c or 'lng' in c)), 'stoplong')
-        
         df_r = build_tree_match(df_r, points_df, radius, r_start_lat, r_start_lon, 'Start')
         df_r = build_tree_match(df_r, points_df, radius, r_stop_lat, r_stop_lon, 'End')
-        
     return df_s, df_r
 
 @st.cache_data(show_spinner=False)
 def process_supply_and_urgent(logs_df, fleet_df, s_date, e_date):
     if fleet_df is None or fleet_df.empty: return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if logs_df is None or logs_df.empty: return fleet_df, pd.DataFrame(), pd.DataFrame()
-
     v_col = next((c for c in logs_df.columns if c in ['vehicle', 'scooter', 'code']), 'vehicle')
     op_col = next((c for c in logs_df.columns if 'operating' in c), 'operating')
     act_col = next((c for c in logs_df.columns if c == 'action'), 'action')
     date_col = next((c for c in logs_df.columns if 'local' in c and 'date' in c), 'date (local)')
     reason_col = next((c for c in logs_df.columns if 'urgent' in c and 'reason' in c), 'urgent reason')
-
     logs_df['clean_code'] = logs_df[v_col].astype(str).str.strip().str.lower()
-    
     active_logs = logs_df[logs_df[op_col].astype(str).str.lower() == 'yes']
     active_codes = active_logs['clean_code'].unique()
     fleet_df['Is Active'] = fleet_df['scooter_code'].isin(active_codes)
-
     urgent_logs = logs_df[logs_df[act_col].isin(['ENTERED_URGENT', 'EXITED_URGENT'])].copy()
     urgent_final = pd.DataFrame()
-    
     if not urgent_logs.empty:
         urgent_logs[date_col] = pd.to_datetime(urgent_logs[date_col], errors='coerce')
         urgent_logs = urgent_logs.sort_values(date_col)
         last_status = urgent_logs.drop_duplicates(subset=['clean_code'], keep='last')
         current_urgent = last_status[last_status[act_col] == 'ENTERED_URGENT'].copy()
-        
         urgent_breakdown = pd.merge(current_urgent, fleet_df, left_on='clean_code', right_on='scooter_code', how='inner')
         urgent_breakdown['Urgent Reason'] = urgent_breakdown[reason_col].fillna("Unknown")
         urgent_final = urgent_breakdown[['scooter_code', 'assigned_area', 'Urgent Reason', date_col]]
-
     logs_with_area = pd.merge(logs_df, fleet_df, left_on='clean_code', right_on='scooter_code', how='inner')
     logs_with_area['Log_Date'] = pd.to_datetime(logs_with_area[date_col]).dt.date
     logs_with_area['Hour_Bucket'] = pd.to_datetime(logs_with_area[date_col]).dt.floor('H')
-    
     daily_active_logs = logs_with_area[logs_with_area[op_col].astype(str).str.lower() == 'yes']
     daily_active_count = daily_active_logs.groupby(['Log_Date', 'assigned_area'])['clean_code'].nunique().reset_index()
     daily_active_count.rename(columns={'clean_code': 'Daily_Active_Baseline', 'assigned_area': 'Area'}, inplace=True)
-    
     start_dt = pd.to_datetime(s_date)
     end_dt = pd.to_datetime(e_date) + timedelta(days=1) - timedelta(seconds=1)
     hourly_range = pd.date_range(start=start_dt, end=end_dt, freq='H')
-    
     master_trend = pd.MultiIndex.from_product([hourly_range, OPERATIONAL_AREAS], names=['Hour_Bucket', 'Area']).to_frame(index=False)
     master_trend['Log_Date'] = master_trend['Hour_Bucket'].dt.date
-    
     master_trend = pd.merge(master_trend, daily_active_count, on=['Log_Date', 'Area'], how='left').fillna(0)
-    
-    urgent_in_bucket = logs_with_area[
-        (logs_with_area[act_col] == 'ENTERED_URGENT') | 
-        (logs_with_area[reason_col].notna())
-    ]
+    urgent_in_bucket = logs_with_area[(logs_with_area[act_col] == 'ENTERED_URGENT') | (logs_with_area[reason_col].notna())]
     urgent_trend = urgent_in_bucket.groupby(['Hour_Bucket', 'assigned_area'])['clean_code'].nunique().reset_index()
     urgent_trend.rename(columns={'clean_code': 'Urgent_Count', 'assigned_area': 'Area'}, inplace=True)
-    
     master_trend = pd.merge(master_trend, urgent_trend, on=['Hour_Bucket', 'Area'], how='left').fillna(0)
     master_trend['Net_Available'] = (master_trend['Daily_Active_Baseline'] - master_trend['Urgent_Count']).clip(lower=0)
-
     return fleet_df, urgent_final, master_trend
 
 @st.cache_data(show_spinner=False)
 def process_ride_utilization_metrics(rides_df, logs_df, fleet_df, s_date, e_date):
     if fleet_df is None or fleet_df.empty: return pd.DataFrame()
     if logs_df is None or logs_df.empty: return pd.DataFrame()
-    
     v_col_l = next((c for c in logs_df.columns if c in ['vehicle', 'scooter', 'code']), 'vehicle')
     op_col_l = next((c for c in logs_df.columns if 'operating' in c), 'operating')
     date_col_l = next((c for c in logs_df.columns if 'local' in c and 'date' in c), 'date (local)')
-
     if not rides_df.empty:
         r_date_col = next((c for c in rides_df.columns if 'start' in c and 'local' in c), 'start_date_local')
         r_scooter_col = next((c for c in rides_df.columns if c in ['scooter', 'code', 'vehicle id']), 'scooter')
         rides_df['Ride_Date'] = pd.to_datetime(rides_df[r_date_col]).dt.date
-
     logs_df['clean_code'] = logs_df[v_col_l].astype(str).str.strip().str.lower()
     logs_with_area = pd.merge(logs_df, fleet_df, left_on='clean_code', right_on='scooter_code', how='inner')
     logs_with_area['Log_Date'] = pd.to_datetime(logs_with_area[date_col_l]).dt.date
     active_population = logs_with_area[logs_with_area[op_col_l].astype(str).str.lower() == 'yes'][['Log_Date', 'assigned_area', 'clean_code']].drop_duplicates()
     active_population.columns = ['Date', 'Area', 'Scooter']
-    
     if not rides_df.empty:
         daily_ride_counts = rides_df.groupby(['Ride_Date', r_scooter_col]).size().reset_index(name='Ride_Count')
         daily_ride_counts.columns = ['Date', 'Scooter', 'Ride_Count']
@@ -297,61 +284,41 @@ def process_ride_utilization_metrics(rides_df, logs_df, fleet_df, s_date, e_date
     else:
         merged = active_population.copy()
         merged['Ride_Count'] = 0
-
     count_0 = merged[merged['Ride_Count'] == 0].groupby(['Date', 'Area'])['Scooter'].nunique().reset_index(name='Exact_0_Rides')
     count_1 = merged[merged['Ride_Count'] == 1].groupby(['Date', 'Area'])['Scooter'].nunique().reset_index(name='Exact_1_Ride')
     count_2_plus = merged[merged['Ride_Count'] >= 2].groupby(['Date', 'Area'])['Scooter'].nunique().reset_index(name='Plus_2_Rides')
-
     start_dt = pd.to_datetime(s_date).date()
     end_dt = pd.to_datetime(e_date).date()
     date_range = pd.date_range(start_dt, end_dt).date
-    
     skeleton = pd.MultiIndex.from_product([date_range, OPERATIONAL_AREAS], names=['Date', 'Area']).to_frame(index=False)
-    
     final_util = pd.merge(skeleton, count_0, on=['Date', 'Area'], how='left').fillna(0)
     final_util = pd.merge(final_util, count_1, on=['Date', 'Area'], how='left').fillna(0)
     final_util = pd.merge(final_util, count_2_plus, on=['Date', 'Area'], how='left').fillna(0)
-    
     return final_util
 
 @st.cache_data(show_spinner=False)
 def process_attendance(df_att, s_date, e_date):
     if df_att is None or df_att.empty: return pd.DataFrame()
-    
     name_col = next((c for c in df_att.columns if 'name' in c), 'name')
     area_col = next((c for c in df_att.columns if 'area' in c), 'area')
     shift_col = next((c for c in df_att.columns if 'shift' in c), 'shift')
     swap_col = next((c for c in df_att.columns if 'swap' in c and 'count' in c), 'battery swap count')
     date_col = next((c for c in df_att.columns if 'check-in date' in c and 'local' in c), 'check-in date (local)')
-    
     df_att['clean_name'] = df_att[name_col].astype(str).str.lower()
     df_att['clean_shift'] = df_att[shift_col].astype(str).str.lower()
-    
     try:
         df_att['Att_Date'] = pd.to_datetime(df_att[date_col], dayfirst=True, errors='coerce').dt.date
     except:
         df_att['Att_Date'] = pd.to_datetime(df_att[date_col], errors='coerce').dt.date
-
-    valid_att = df_att[
-        (~df_att['clean_name'].str.contains("tech", na=False)) & 
-        (~df_att['clean_shift'].str.contains("supervisor", na=False))
-    ].copy()
-    
-    att_metrics = valid_att.groupby(['Att_Date', area_col]).agg(
-        Active_Shifts=(name_col, 'count'),
-        Total_Swaps=(swap_col, 'sum')
-    ).reset_index()
-    
+    valid_att = df_att[(~df_att['clean_name'].str.contains("tech", na=False)) & (~df_att['clean_shift'].str.contains("supervisor", na=False))].copy()
+    att_metrics = valid_att.groupby(['Att_Date', area_col]).agg(Active_Shifts=(name_col, 'count'), Total_Swaps=(swap_col, 'sum')).reset_index()
     att_metrics.rename(columns={area_col: 'Area', 'Att_Date': 'Date'}, inplace=True)
     att_metrics['Productivity'] = np.where(att_metrics['Active_Shifts']>0, att_metrics['Total_Swaps']/att_metrics['Active_Shifts'], 0)
-    
     start_dt = pd.to_datetime(s_date).date()
     end_dt = pd.to_datetime(e_date).date()
     date_range = pd.date_range(start_dt, end_dt).date
-    
     skeleton = pd.MultiIndex.from_product([date_range, OPERATIONAL_AREAS], names=['Date', 'Area']).to_frame(index=False)
     final_att = pd.merge(skeleton, att_metrics, on=['Date', 'Area'], how='left').fillna(0)
-    
     return final_att
 
 def get_time_bucket(df, time_col, interval):
@@ -375,7 +342,7 @@ with st.sidebar:
 
 col_title, col_refresh = st.columns([3, 1])
 with col_title:
-    st.title("⚡ Master Dashboard v10.2")
+    st.title("⚡ Master Dashboard v10.4")
 with col_refresh:
     st.write("") 
     if st.session_state.last_update_time:
@@ -393,7 +360,8 @@ with col_refresh:
                 except: pass
             refresh_end = datetime.now().date()
             
-            new_s, new_r, new_l, new_a, err = fetch_api_data_live(api_token, refresh_start, refresh_end)
+            # Using Batched Fetcher for refresh
+            new_s, new_r, new_l, new_a, err = fetch_api_data_batched(api_token, refresh_start, refresh_end)
             
             if err:
                 st.error(f"Refresh failed: {err}")
@@ -406,10 +374,10 @@ with col_refresh:
                     st.session_state.master_r_df = safe_dedupe(st.session_state.master_r_df, 'id')
                 if not new_l.empty:
                     st.session_state.master_l_df = pd.concat([st.session_state.master_l_df, new_l])
-                    st.session_state.master_l_df = safe_dedupe(st.session_state.master_l_df, 'uuid') # Dedupe by all if uuid not found
+                    st.session_state.master_l_df = safe_dedupe(st.session_state.master_l_df, 'uuid')
                 if not new_a.empty:
                     st.session_state.master_a_df = pd.concat([st.session_state.master_a_df, new_a])
-                    st.session_state.master_a_df = safe_dedupe(st.session_state.master_a_df, 'name') # Fallback dedupe
+                    st.session_state.master_a_df = safe_dedupe(st.session_state.master_a_df, 'name')
                 
                 st.session_state.last_update_time = datetime.now()
                 st.success("Data Refreshed!")
@@ -424,11 +392,11 @@ if c_btn.button("🚀 Launch Master Dashboard", type="primary", use_container_wi
         st.error("Missing Token or Fleet File!")
     else:
         points_df, fleet_df = load_static_files(p_files, f_file)
-        raw_s, raw_r, raw_l, raw_a, err = fetch_api_data_live(api_token, s_date, e_date)
+        # Using Batched Fetcher for main launch
+        raw_s, raw_r, raw_l, raw_a, err = fetch_api_data_batched(api_token, s_date, e_date)
         
         if err: st.error(err)
         else:
-            # RESET INDEX HERE TOO
             st.session_state.master_s_df = raw_s.reset_index(drop=True)
             st.session_state.master_r_df = raw_r.reset_index(drop=True)
             st.session_state.master_l_df = raw_l.reset_index(drop=True)
