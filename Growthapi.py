@@ -5,17 +5,21 @@ import requests
 import json
 import altair as alt
 import time
+import pickle
+import os
 from io import BytesIO
 from datetime import datetime, timedelta
 from scipy.spatial import cKDTree
+from github import Github
 
-st.set_page_config(page_title="Master Dashboard v10.4", layout="wide", page_icon="⚡", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Master Dashboard v10.6", layout="wide", page_icon="⚡", initial_sidebar_state="expanded")
 
 # ============================================================================
 # 1. CONFIGURATION & STATE
 # ============================================================================
 OPERATIONAL_AREAS = ["Maadi", "Alexandria", "Downtown 1", "Zahraa El Maadi", "Masr El Gedida"]
 TIME_OFFSET = "+02:00"
+MASTER_FILE_NAME = "master_state.pkl"
 
 # Initialize Session State
 if 'master_s_df' not in st.session_state: st.session_state.master_s_df = pd.DataFrame()
@@ -26,10 +30,39 @@ if 'last_update_time' not in st.session_state: st.session_state.last_update_time
 if 'data_initialized' not in st.session_state: st.session_state.data_initialized = False
 
 # ============================================================================
-# 2. HELPERS
+# 2. GITHUB CLOUD SYNC
+# ============================================================================
+def push_to_github(data_obj, commit_msg):
+    """Pushes the updated master state file back to GitHub."""
+    try:
+        # Retrieve Secrets
+        token = st.secrets["GITHUB_TOKEN"]
+        repo_name = st.secrets["REPO_NAME"]
+        
+        g = Github(token)
+        repo = g.get_repo(repo_name)
+        
+        # Serialize Data
+        buffer = BytesIO()
+        pickle.dump(data_obj, buffer)
+        content = buffer.getvalue()
+        
+        # Check if file exists to Update or Create
+        try:
+            contents = repo.get_contents(MASTER_FILE_NAME)
+            repo.update_file(contents.path, commit_msg, content, contents.sha)
+            return True, "Updated existing Master File."
+        except:
+            repo.create_file(MASTER_FILE_NAME, commit_msg, content)
+            return True, "Created new Master File."
+            
+    except Exception as e:
+        return False, str(e)
+
+# ============================================================================
+# 3. HELPERS
 # ============================================================================
 def safe_dedupe(df, target_col):
-    """Safely remove duplicates and RESET INDEX to prevent 'duplicate labels' error."""
     if df.empty: return df
     if target_col in df.columns:
         df = df.drop_duplicates(subset=target_col, keep='last')
@@ -61,83 +94,65 @@ def load_static_files(points_files, fleet_file):
             if fleet_file.name.endswith('.csv'): d = pd.read_csv(fleet_file)
             else: d = pd.read_excel(fleet_file)
             d.columns = d.columns.str.lower().str.strip()
-            
             c_col = next((c for c in d.columns if c in ['code', 'vehicle id', 'scooter']), None)
             a_col = next((c for c in d.columns if c in ['area', 'assigned area']), None)
-            
             if c_col and a_col:
                 d = d.rename(columns={c_col: 'scooter_code', a_col: 'assigned_area'})
                 d['scooter_code'] = d['scooter_code'].astype(str).str.strip().str.lower()
                 d['assigned_area'] = d['assigned_area'].astype(str).str.strip()
                 fleet_df = d[d['assigned_area'].isin(OPERATIONAL_AREAS)].copy()
         except: pass
-
     return points_df, fleet_df
 
 def fetch_chunk(base, head, payload):
-    """Helper to fetch a single API call safely."""
     try:
         r = requests.post(base, headers=head, json=payload, timeout=45)
         if r.status_code == 200:
             df = pd.read_excel(BytesIO(r.content))
-            if not df.empty: 
-                df.columns = df.columns.str.lower().str.strip()
+            if not df.empty: df.columns = df.columns.str.lower().str.strip()
             return df
         return pd.DataFrame()
     except:
         return pd.DataFrame()
 
 def fetch_api_data_batched(token, start_dt, end_dt):
-    """Fetches data in 7-day chunks to prevent timeouts."""
     base = "https://dashboard.rabbit-api.app/export"
     head = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    # 1. Generate Batches
     date_ranges = []
     curr = start_dt
     while curr <= end_dt:
-        nxt = min(curr + timedelta(days=6), end_dt) # 7-day chunks
+        nxt = min(curr + timedelta(days=6), end_dt)
         date_ranges.append((curr, nxt))
         curr = nxt + timedelta(days=1)
 
-    # 2. UI Setup
     prog_bar = st.progress(0)
     status_text = st.empty()
     total_batches = len(date_ranges)
-    
-    # 3. Storage
     all_s, all_r, all_l, all_a = [], [], [], []
     
-    # 4. Loop
     for idx, (s, e) in enumerate(date_ranges):
         s_str = f"{s}T00:00:00{TIME_OFFSET}"
         e_str = f"{e}T23:59:59{TIME_OFFSET}"
-        
-        # Update UI
         pct = idx / total_batches
         prog_bar.progress(pct)
         status_text.markdown(f"**📥 Fetching Batch {idx+1}/{total_batches}:** {s} to {e}...")
 
-        # -- Sessions --
         p_sess = {"module": "AppSessions", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str, "lat": None, "lng": None, "radius": None, "inRide": "all", "error": "", "areas": []})}
         all_s.append(fetch_chunk(base, head, p_sess))
 
-        # -- Rides --
         r_fields = "id,userId,area,userSignupDateLocal,scooter,duration,totalCost,actualCost,paidWithBalance,paidWithPromocode,paidWithSubscription,start_date_local,end_date_local,startLat,startLong,stopLat,stopLong,rating"
         p_ride = {"module": "RidesSucess", "format": "excel", "fields": r_fields, "filters": json.dumps({"startDate": s_str, "endDate": e_str})}
         all_r.append(fetch_chunk(base, head, p_ride))
 
-        # -- Logs --
         p_logs = {"module": "VehicleLogs", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str, "isOperating": "All", "logCase": "All"})}
         all_l.append(fetch_chunk(base, head, p_logs))
 
-        # -- Attendance --
         p_attend = {"module": "Attendance", "format": "excel", "filters": json.dumps({"startDate": s_str, "endDate": e_str})}
         all_a.append(fetch_chunk(base, head, p_attend))
 
-    # 5. Finalize
     prog_bar.progress(1.0)
-    status_text.success("✅ Fetch Complete! Merging data...")
+    status_text.success("✅ Fetch Complete! Merging...")
     time.sleep(0.5)
     status_text.empty()
     prog_bar.empty()
@@ -150,7 +165,7 @@ def fetch_api_data_batched(token, start_dt, end_dt):
     return final_s, final_r, final_l, final_a, None
 
 # ============================================================================
-# 3. PROCESSING ENGINES
+# 4. PROCESSING ENGINES
 # ============================================================================
 def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
     if df.empty or points_df is None or points_df.empty: return df
@@ -158,17 +173,14 @@ def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
     df.columns = df.columns.str.lower().str.strip()
     lat_col = lat_col.lower()
     lon_col = lon_col.lower()
-    
     cols = points_df.columns
     p_lat = next((c for c in ['lat', 'latitude'] if c in cols), None)
     p_lon = next((c for c in ['lng', 'lon', 'longitude'] if c in cols), None)
     if not p_lat: return df
-
     if lat_col not in df.columns or lon_col not in df.columns: return df
     valid = df.dropna(subset=[lat_col, lon_col]).copy()
     valid = valid[(valid[lat_col]!=0) & (valid[lon_col]!=0)]
     if valid.empty: return df
-
     def to_cart(lat, lon):
         rad_lat, rad_lon = np.radians(lat), np.radians(lon)
         a = 6371000.0
@@ -176,17 +188,14 @@ def build_tree_match(df, points_df, radius, lat_col, lon_col, prefix=None):
         y = a * np.cos(rad_lat) * np.sin(rad_lon)
         z = a * np.sin(rad_lat)
         return np.column_stack([x, y, z])
-
     p_cart = to_cart(points_df[p_lat].values, points_df[p_lon].values)
     t_cart = to_cart(valid[lat_col].values, valid[lon_col].values)
     tree = cKDTree(p_cart)
     dists, idxs = tree.query(t_cart, k=1)
     mask = dists <= radius
     matched_idxs = idxs[mask]
-    
     p_area = next((c for c in ['area'] if c in cols), None)
     p_neigh = next((c for c in ['neighborhood', 'neighbourhood', 'point name', 'name'] if c in cols), None)
-
     if prefix:
         col_name = f'{prefix.lower()} neighborhood'
         df[col_name] = 'Unknown'
@@ -330,27 +339,46 @@ def get_time_bucket(df, time_col, interval):
     return df[time_col]
 
 # ============================================================================
-# 4. MAIN APP LOGIC
+# 4. MAIN LAYOUT & LOGIC
 # ============================================================================
 
+# 1. SIDEBAR & AUTO-LOAD
 with st.sidebar:
     st.header("🛠️ Setup")
     api_token = st.text_input("1. API Token", type="password")
     p_files = st.file_uploader("2. Distribution Points", accept_multiple_files=True)
     f_file = st.file_uploader("3. Fleet File", type=['xlsx', 'csv'])
     radius = st.slider("Matching Radius (m)", 100, 1000, 200)
+    
+    # AUTO-LOAD FROM REPO
+    if not st.session_state.data_initialized and os.path.exists(MASTER_FILE_NAME):
+        try:
+            with st.spinner("Found Master File in Cloud. Loading..."):
+                state_data = pd.read_pickle(MASTER_FILE_NAME)
+                st.session_state.master_s_df = state_data['sessions']
+                st.session_state.master_r_df = state_data['rides']
+                st.session_state.master_l_df = state_data['logs']
+                st.session_state.master_a_df = state_data['attendance']
+                st.session_state.last_update_time = state_data.get('timestamp', datetime.now())
+                st.session_state.data_initialized = True
+                st.success("✅ Cloud Data Loaded!")
+        except Exception as e:
+            st.error(f"Error loading Cloud File: {e}")
 
 col_title, col_refresh = st.columns([3, 1])
 with col_title:
-    st.title("⚡ Master Dashboard v10.4")
+    st.title("⚡ Master Dashboard v10.6")
 with col_refresh:
     st.write("") 
     if st.session_state.last_update_time:
         st.caption(f"Last updated: {st.session_state.last_update_time.strftime('%Y-%m-%d %I:%M %p')}")
     
+    # REFRESH LOGIC
     if st.button("🔄 Refresh New Data", type="secondary", use_container_width=True):
-        if not api_token or not st.session_state.data_initialized:
-            st.error("Please Launch Dashboard first!")
+        if not api_token:
+            st.error("Missing API Token!")
+        elif not st.session_state.data_initialized:
+            st.error("Launch First!")
         else:
             refresh_start = datetime.now().date() 
             if not st.session_state.master_s_df.empty:
@@ -360,7 +388,6 @@ with col_refresh:
                 except: pass
             refresh_end = datetime.now().date()
             
-            # Using Batched Fetcher for refresh
             new_s, new_r, new_l, new_a, err = fetch_api_data_batched(api_token, refresh_start, refresh_end)
             
             if err:
@@ -383,16 +410,37 @@ with col_refresh:
                 st.success("Data Refreshed!")
                 st.rerun()
 
+    # CLOUD PUSH BUTTON (Appears only if data exists)
+    if st.session_state.data_initialized:
+        if st.button("☁️ Push to Cloud (GitHub)", type="primary", use_container_width=True):
+            if "GITHUB_TOKEN" not in st.secrets:
+                st.error("No GitHub Token found in Secrets!")
+            else:
+                with st.spinner("Pushing Master File to GitHub..."):
+                    save_obj = {
+                        'sessions': st.session_state.master_s_df,
+                        'rides': st.session_state.master_r_df,
+                        'logs': st.session_state.master_l_df,
+                        'attendance': st.session_state.master_a_df,
+                        'timestamp': datetime.now()
+                    }
+                    success, msg = push_to_github(save_obj, f"Auto-update: {datetime.now()}")
+                    if success:
+                        st.success(f"Success! {msg}")
+                    else:
+                        st.error(f"Failed: {msg}")
+
+# 2. DATE FILTERS (For API Launch or Visualization)
 c_d1, c_d2, c_btn = st.columns([2, 2, 1])
 s_date = c_d1.date_input("Start Date", datetime.now().date() - timedelta(days=7))
 e_date = c_d2.date_input("End Date", datetime.now().date())
 
-if c_btn.button("🚀 Launch Master Dashboard", type="primary", use_container_width=True):
+# 3. LAUNCH BUTTON (API LOAD)
+if c_btn.button("🚀 Launch via API", type="secondary", use_container_width=True):
     if not api_token or not f_file:
         st.error("Missing Token or Fleet File!")
     else:
         points_df, fleet_df = load_static_files(p_files, f_file)
-        # Using Batched Fetcher for main launch
         raw_s, raw_r, raw_l, raw_a, err = fetch_api_data_batched(api_token, s_date, e_date)
         
         if err: st.error(err)
@@ -405,17 +453,21 @@ if c_btn.button("🚀 Launch Master Dashboard", type="primary", use_container_wi
             st.session_state.last_update_time = datetime.now()
             st.success("Analysis Complete!")
 
-# ============================================================================
-# 5. RENDER LOGIC
-# ============================================================================
+# 4. DASHBOARD RENDER
 if st.session_state.data_initialized:
     if f_file: 
         points_df, fleet_df = load_static_files(p_files, f_file)
     
-    final_s, final_r = process_data(st.session_state.master_s_df.copy(), st.session_state.master_r_df.copy(), points_df, radius)
-    final_fleet, final_urgent, final_trend = process_supply_and_urgent(st.session_state.master_l_df.copy(), fleet_df, s_date, e_date)
-    final_util = process_ride_utilization_metrics(final_r, st.session_state.master_l_df.copy(), fleet_df, s_date, e_date)
-    final_att = process_attendance(st.session_state.master_a_df.copy(), s_date, e_date)
+    # Visualization Filtering
+    view_s = st.session_state.master_s_df
+    view_r = st.session_state.master_r_df
+    view_l = st.session_state.master_l_df
+    view_a = st.session_state.master_a_df
+    
+    final_s, final_r = process_data(view_s.copy(), view_r.copy(), points_df, radius)
+    final_fleet, final_urgent, final_trend = process_supply_and_urgent(view_l.copy(), fleet_df, s_date, e_date)
+    final_util = process_ride_utilization_metrics(final_r, view_l.copy(), fleet_df, s_date, e_date)
+    final_att = process_attendance(view_a.copy(), s_date, e_date)
 
     st.write("### 🔍 Global Filters")
     with st.container():
@@ -438,9 +490,16 @@ if st.session_state.data_initialized:
     f_util = final_util[final_util['Area'].isin(sel_areas)].copy() if not final_util.empty else pd.DataFrame()
     f_att = final_att[final_att['Area'].isin(sel_areas)].copy() if not final_att.empty else pd.DataFrame()
 
+    if not fs_df.empty:
+        t_col = next((c for c in fs_df.columns if 'created' in c), None)
+        if t_col: fs_df = fs_df[(pd.to_datetime(fs_df[t_col]).dt.date >= s_date) & (pd.to_datetime(fs_df[t_col]).dt.date <= e_date)]
+    if not fr_df.empty:
+        t_col = next((c for c in fr_df.columns if 'start' in c and 'local' in c), None)
+        if t_col: fr_df = fr_df[(pd.to_datetime(fr_df[t_col]).dt.date >= s_date) & (pd.to_datetime(fr_df[t_col]).dt.date <= e_date)]
+
     tab_demand, tab_supply = st.tabs(["📈 Demand Side", "🛴 Supply Side"])
 
-    # --- DEMAND TAB ---
+    # --- DEMAND ---
     with tab_demand:
         dm1, dm2, dm3, dm4 = st.columns(4)
         dm1.metric("Sessions", f"{len(fs_df):,}")
@@ -512,40 +571,36 @@ if st.session_state.data_initialized:
                 st.altair_chart(plot_heatmap('Missed Opps', 'Missed Opps Heatmap'), use_container_width=True)
                 st.altair_chart(plot_heatmap('Fulfillment', 'Fulfillment Heatmap', '.1%'), use_container_width=True)
 
-    # --- SUPPLY TAB ---
+    # --- SUPPLY ---
     with tab_supply:
         if not f_supply.empty:
             total_fleet = len(f_supply)
             active_fleet = f_supply['Is Active'].sum()
             total_avail_hours = f_trend['Net_Available'].sum() if not f_trend.empty else 0
-            
             hours_diff = (pd.to_datetime(e_date) - pd.to_datetime(s_date)).total_seconds() / 3600
             hours_diff = max(hours_diff, 24)
             avg_avail_fleet = total_avail_hours / hours_diff
             
             sm1, sm2, sm3, sm4 = st.columns(4)
             sm1.metric("Total Fleet", f"{total_fleet:,}")
-            sm2.metric("Active Fleet", f"{active_fleet:,}", help="Currently active scooters")
-            sm3.metric("Available Hours", f"{total_avail_hours:,.0f}", help="Sum of (Active - Urgent) per hour")
-            sm4.metric("Avg Available Fleet", f"{avg_avail_fleet:.1f}", help="Avg number of available scooters")
-            
+            sm2.metric("Active Fleet", f"{active_fleet:,}")
+            sm3.metric("Available Hours", f"{total_avail_hours:,.0f}")
+            sm4.metric("Avg Available Fleet", f"{avg_avail_fleet:.1f}")
             st.divider()
             
             if not f_trend.empty:
                 f_trend['Chart_Bucket'] = get_time_bucket(f_trend, 'Hour_Bucket', sel_time)
                 
                 chart_agg_avail = f_trend.groupby(['Chart_Bucket', 'Area'])['Net_Available'].sum().reset_index()
-                st.write("#### 📉 Available Hours Trend (Effective Capacity)")
+                st.write("#### 📉 Available Hours Trend")
                 avail_chart = alt.Chart(chart_agg_avail).mark_line(point=True).encode(
                     x=alt.X('Chart_Bucket', axis=alt.Axis(format='%b %d %H:%M' if sel_time=='Hourly' else '%b %d')),
                     y=alt.Y('Net_Available', title='Available Hours'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Net_Available']
                 ).properties(height=350).interactive()
                 st.altair_chart(avail_chart, use_container_width=True)
                 
-                st.write("") 
-                
                 chart_agg_active = f_trend.groupby(['Chart_Bucket', 'Area'])['Daily_Active_Baseline'].max().reset_index()
-                st.write("#### 🛴 Active Scooters Trend (Active Population)")
+                st.write("#### 🛴 Active Scooters Trend")
                 active_chart = alt.Chart(chart_agg_active).mark_line(point=True).encode(
                     x=alt.X('Chart_Bucket', axis=alt.Axis(format='%b %d %H:%M' if sel_time=='Hourly' else '%b %d')),
                     y=alt.Y('Daily_Active_Baseline', title='Active Fleet Count'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Daily_Active_Baseline']
@@ -556,57 +611,26 @@ if st.session_state.data_initialized:
                 st.divider()
                 st.write("#### 🚲 Active Fleet Utilization Funnel")
                 f_util['Chart_Bucket'] = pd.to_datetime(f_util['Date'])
-                
                 c_u1, c_u2, c_u3 = st.columns(3)
                 with c_u1:
-                    st.write("**= 0 Rides**")
-                    u0 = alt.Chart(f_util).mark_line(point=True).encode(
-                        x=alt.X('Chart_Bucket', title='Date'), y=alt.Y('Exact_0_Rides', title='Count'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Exact_0_Rides']
-                    ).properties(height=280).interactive()
+                    u0 = alt.Chart(f_util).mark_line(point=True).encode(x=alt.X('Chart_Bucket'), y=alt.Y('Exact_0_Rides'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Exact_0_Rides']).properties(title="= 0 Rides", height=280).interactive()
                     st.altair_chart(u0, use_container_width=True)
                 with c_u2:
-                    st.write("**= 1 Ride**")
-                    u1 = alt.Chart(f_util).mark_line(point=True).encode(
-                        x=alt.X('Chart_Bucket', title='Date'), y=alt.Y('Exact_1_Ride', title='Count'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Exact_1_Ride']
-                    ).properties(height=280).interactive()
+                    u1 = alt.Chart(f_util).mark_line(point=True).encode(x=alt.X('Chart_Bucket'), y=alt.Y('Exact_1_Ride'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Exact_1_Ride']).properties(title="= 1 Ride", height=280).interactive()
                     st.altair_chart(u1, use_container_width=True)
                 with c_u3:
-                    st.write("**≥ 2 Rides**")
-                    u2 = alt.Chart(f_util).mark_line(point=True).encode(
-                        x=alt.X('Chart_Bucket', title='Date'), y=alt.Y('Plus_2_Rides', title='Count'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Plus_2_Rides']
-                    ).properties(height=280).interactive()
+                    u2 = alt.Chart(f_util).mark_line(point=True).encode(x=alt.X('Chart_Bucket'), y=alt.Y('Plus_2_Rides'), color='Area', tooltip=['Chart_Bucket', 'Area', 'Plus_2_Rides']).properties(title="≥ 2 Rides", height=280).interactive()
                     st.altair_chart(u2, use_container_width=True)
 
             if not f_att.empty:
                 st.divider()
                 st.write("#### 🔋 Operations & Productivity")
-                
-                total_active_shifts = f_att['Active_Shifts'].sum()
-                total_swaps = f_att['Total_Swaps'].sum()
-                avg_prod = total_swaps / total_active_shifts if total_active_shifts > 0 else 0
-                
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Active Shifts", f"{total_active_shifts:,}")
-                m2.metric("Total Swaps", f"{total_swaps:,.0f}")
-                m3.metric("Productivity", f"{avg_prod:.1f}", help="Swaps per Shift")
-                
                 f_att['Chart_Bucket'] = pd.to_datetime(f_att['Date'])
-                st.write("**Active Shifts Trend**")
-                c1 = alt.Chart(f_att).mark_line(point=True).encode(
-                    x=alt.X('Chart_Bucket', title='Date'), y=alt.Y('Active_Shifts'), color='Area', tooltip=['Date', 'Area', 'Active_Shifts']
-                ).properties(height=250).interactive()
+                c1 = alt.Chart(f_att).mark_line(point=True).encode(x='Chart_Bucket', y='Active_Shifts', color='Area', tooltip=['Date', 'Area', 'Active_Shifts']).properties(title="Active Shifts", height=250).interactive()
                 st.altair_chart(c1, use_container_width=True)
-                
-                st.write("**Total Swaps Trend**")
-                c2 = alt.Chart(f_att).mark_line(point=True).encode(
-                    x=alt.X('Chart_Bucket', title='Date'), y=alt.Y('Total_Swaps'), color='Area', tooltip=['Date', 'Area', 'Total_Swaps']
-                ).properties(height=250).interactive()
+                c2 = alt.Chart(f_att).mark_line(point=True).encode(x='Chart_Bucket', y='Total_Swaps', color='Area', tooltip=['Date', 'Area', 'Total_Swaps']).properties(title="Total Swaps", height=250).interactive()
                 st.altair_chart(c2, use_container_width=True)
-                
-                st.write("**Productivity Trend (Swaps/Shift)**")
-                c3 = alt.Chart(f_att).mark_line(point=True).encode(
-                    x=alt.X('Chart_Bucket', title='Date'), y=alt.Y('Productivity'), color='Area', tooltip=['Date', 'Area', alt.Tooltip('Productivity', format='.1f')]
-                ).properties(height=250).interactive()
+                c3 = alt.Chart(f_att).mark_line(point=True).encode(x='Chart_Bucket', y='Productivity', color='Area', tooltip=['Date', 'Area', alt.Tooltip('Productivity', format='.1f')]).properties(title="Productivity", height=250).interactive()
                 st.altair_chart(c3, use_container_width=True)
 
             if not f_urgent.empty:
